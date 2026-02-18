@@ -1,12 +1,4 @@
 # app.py
-# MinION QC + SQLite + Streamlit UI (OPTIMIZED VERSION)
-#
-# Performance improvements:
-# - Single-pass BAM processing (combined stats + MAPQ)
-# - Unified streaming with configurable filters
-# - Parallel BAM processing with multiprocessing
-# - Batch inserts for sticky sequences
-# - Extracted config constants
 #
 # Requirements (in your venv):
 #   pip install streamlit pandas
