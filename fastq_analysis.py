@@ -1,14 +1,6 @@
-"""
-MinION Nanobody Analysis — v2
-Ingest a full run folder — auto-detects all targets and runs the Test12.py
-pipeline (trim+translate, easy-cluster, normalize) for each target group.
-Results stored in SQLite. One ingest, all targets, instant reload.
-"""
-
 import gzip
 import hashlib
 import json
-import math
 import re
 import shutil
 import sqlite3
@@ -17,7 +9,7 @@ import tempfile
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -30,11 +22,6 @@ import streamlit.components.v1 as components
 from Bio import SeqIO
 from Bio.Seq import Seq
 from plotly.subplots import make_subplots
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ALL FUNCTIONS BELOW TAKEN DIRECTLY FROM Test12.py — DO NOT MODIFY LOGIC
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 # -----------------------------
@@ -597,7 +584,7 @@ def plot_abundance_vs_differential(
     return fig, plot_data_diff
 
 
-# NEW: Plotly version for interactive hover (ID + AA sequence)
+# Plotly version for interactive hover (ID + AA sequence)
 def plot_abundance_vs_differential_plotly(
     count_matrix: pd.DataFrame,
     baseline_lib: str,
@@ -759,9 +746,9 @@ def plot_abundance_vs_differential_plotly(
 # -----------------------------
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------
 # BARCODE FOLDER PARSING
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------
 
 def parse_barcode_label(folder_name: str) -> dict:
     name = folder_name.strip()
@@ -843,11 +830,11 @@ def group_barcodes_by_target(barcodes: List[dict]) -> Dict[str, dict]:
     return groups
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------
 # DATABASE
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------
 
-DEFAULT_DB                   = "~/minion_nanobody_v2.db"
+DEFAULT_DB                   = "~/minion_nanobody.db"
 DEFAULT_START                = "ATGGCC"
 DEFAULT_END                  = "GGCGCGC"
 DEFAULT_LENGTH               = 80
@@ -926,9 +913,9 @@ def sql_df(conn: sqlite3.Connection, sql: str, params=()) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# INGEST — whole run, one target at a time using Test12.py pipeline
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------
+# INGEST — whole run, one target at a time
+# -----------------------------
 
 def ingest_target(
     conn: sqlite3.Connection,
@@ -947,7 +934,7 @@ def ingest_target(
     drop_unclustered: bool,
     progress_cb=None,
 ):
-    """Run Test12.py pipeline for one target group and store results."""
+    """Run pipeline for one target group and store results."""
     def log(msg):
         if progress_cb:
             progress_cb(f"  [{target}] {msg}")
@@ -983,23 +970,23 @@ def ingest_target(
         cluster_tmp    = tmp_path / "mmseqs_tmp"
         cluster_tsv    = tmp_path / "clusters_cluster.tsv"
 
-        # Count reads (Test12.py)
+        # Count reads
         log("Counting reads...")
         total_reads_control  = count_fastq_records(control_files)
         total_reads_1xpanned = count_fastq_records(one_x_files)
         total_reads_2xpanned = count_fastq_records(two_x_files)
         log(f"control={total_reads_control:,}  1x={total_reads_1xpanned:,}  2x={total_reads_2xpanned:,}")
 
-        # Combine (Test12.py)
+        # Combine
         log("Combining FASTQs...")
         combine_fastqs(all_inputs, combined_fastq)
 
-        # Trim + translate (Test12.py)
+        # Trim + translate 
         log(f"Trimming (START={START}, END={END}) and translating...")
         kept5, discarded5 = trim_translate_fastq_to_fasta(combined_fastq, trimmed_fasta, START=START, END=END)
         log(f"Kept {kept5:,}, discarded {discarded5:,}")
 
-        # Filter (Test12.py)
+        # Filter
         log(f"Filtering (min AA length={LENGTH})...")
         kept6, discarded6 = filter_aa_fasta(trimmed_fasta, filtered_fasta, LENGTH=int(LENGTH))
         log(f"Kept {kept6:,}, discarded {discarded6:,}")
@@ -1008,7 +995,7 @@ def ingest_target(
             log("No sequences passed filtering — skipping. Check START/END anchors.")
             return
 
-        # Cluster (Test12.py)
+        # Cluster 
         mode_str = "easy-linclust" if use_linclust else "easy-cluster"
         log(f"Clustering with MMseqs2 {mode_str}...")
         run_mmseqs_easy_cluster(
@@ -1021,7 +1008,7 @@ def ingest_target(
             return
         log("Clustering complete")
 
-        # Count matrix (Test12.py)
+        # Count matrix 
         log("Building count matrix...")
         lib_paths = {"control": control_dir}
         if onex_dir:  lib_paths["1xpanned"] = onex_dir
@@ -1035,7 +1022,7 @@ def ingest_target(
             if col not in count_matrix.columns:
                 count_matrix[col] = 0
 
-        # Normalize (Test12.py — exact formula)
+        # Normalize 
         log("Normalizing...")
         count_matrix["control_norm"] = count_matrix["control"].astype(float).round(0).astype("Int64")
         if total_reads_control > 0 and total_reads_1xpanned > 0:
@@ -1060,7 +1047,7 @@ def ingest_target(
         n_clusters = len(count_matrix)
         log(f"{n_clusters:,} clusters")
 
-        # Fetch sequences (Test12.py)
+        # Get sequences
         log("Fetching AA sequences...")
         all_heads = count_matrix["cluster_head"].astype(str).tolist()
         seq_map = fetch_fasta_sequences_by_id(filtered_fasta, all_heads)
@@ -1198,9 +1185,9 @@ def ingest_run(
     return run_id
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------
 # LOAD FROM DB
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------
 
 def load_count_matrix(conn: sqlite3.Connection, run_id: str, target: str) -> pd.DataFrame:
     counts = sql_df(conn,
@@ -1223,9 +1210,9 @@ def load_count_matrix(conn: sqlite3.Connection, run_id: str, target: str) -> pd.
     return result
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------
 # STREAMLIT PAGES
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------
 
 def page_overview(conn: sqlite3.Connection):
     st.header("Overview")
@@ -1286,14 +1273,14 @@ def page_enrichment(conn: sqlite3.Connection):
         st.warning("No cluster counts found for this target.")
         return
 
-    # Use normalized counts (Test12.py)
+    # Use normalized counts
     count_matrix_for_plots = count_matrix.copy()
     for lib in ["control", "1xpanned", "2xpanned"]:
         norm_col = f"{lib}_norm"
         if norm_col in count_matrix_for_plots.columns:
             count_matrix_for_plots[lib] = pd.to_numeric(count_matrix_for_plots[norm_col], errors="coerce")
 
-    # Count matrix preview — add fold_enrichment column
+    # Count matrix preview 
     cm_display = count_matrix.copy()
     if "2xpanned_norm" in cm_display.columns and "control_norm" in cm_display.columns:
         cm_display["fold_enrichment"] = cm_display.apply(
@@ -1319,7 +1306,7 @@ def page_enrichment(conn: sqlite3.Connection):
                        f"{run_id[:8]}_{target}_count_matrix.csv", "text/csv")
 
 
-    # Top sequences (Test12.py)
+    # Top sequences
     if show_sequences:
         st.subheader(f"Top {top_n} cluster amino-acid sequences")
         top_ids = count_matrix["cluster_head"].astype(str).head(top_n).tolist()
@@ -1340,7 +1327,7 @@ def page_enrichment(conn: sqlite3.Connection):
 
     st.divider()
 
-    # Abundance distribution (Test12.py)
+    # Abundance distribution
     st.subheader("Abundance distribution by library")
     cluster_counts_long = sql_df(conn,
         "SELECT library_id, cluster_head, raw_count as n FROM cluster_counts WHERE run_id=? AND target=?",
@@ -1363,7 +1350,7 @@ def page_enrichment(conn: sqlite3.Connection):
     # Determine condition libs (may only have 1xpanned if no R2)
     condition_libs = [c for c in ["1xpanned", "2xpanned"] if c in count_matrix_for_plots.columns and count_matrix_for_plots[c].sum() > 0]
 
-    # Interactive Plotly scatter (Test12.py)
+    # Interactive Plotly scatter 
     st.subheader("Differential abundance")
     diff_fig_plotly = plot_abundance_vs_differential_plotly(
         count_matrix=count_matrix_for_plots,
@@ -1436,8 +1423,7 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
 
     with st.expander("MMseqs2 parameters"):
         use_linclust  = st.checkbox("Use easy-linclust (fast) instead of easy-cluster",
-                                    value=False,
-                                    help="easy-cluster matches Test12.py exactly. easy-linclust is ~10x faster.")
+                                    value=False)
         mm_min_seq_id = st.number_input("min_seq_id", 0.0, 1.0, 0.90, 0.01, format="%.2f")
         mm_coverage   = st.number_input("coverage",   0.0, 1.0, 0.90, 0.01, format="%.2f")
         mm_cov_mode   = st.number_input("cov_mode",   0, 5, 0, 1)
@@ -1538,13 +1524,13 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
             st.rerun()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------
 # MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------
 
 def main():
-    st.set_page_config(page_title="MinION Nanobody Analysis v2", layout="wide")
-    st.title("MinION Nanobody Analysis v2")
+    st.set_page_config(page_title="MinION Nanobody Analysis", layout="wide")
+    st.title("MinION Nanobody Analysis")
 
     db_path = Path(DEFAULT_DB).expanduser()
     conn = connect_db(db_path)
