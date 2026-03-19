@@ -5,8 +5,6 @@ pipeline (trim+translate, easy-cluster, normalize) for each target group.
 Results stored in SQLite. One ingest, all targets, instant reload.
 """
 
-from __future__ import annotations
-
 import gzip
 import hashlib
 import json
