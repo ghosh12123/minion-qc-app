@@ -7,6 +7,8 @@ Results stored in SQLite. One ingest, all targets, instant reload.
 
 import gzip
 import hashlib
+import multiprocessing as mp
+import os
 import json
 import re
 import shutil
@@ -1459,6 +1461,211 @@ def sql_df(conn: sqlite3.Connection, sql: str, params=()) -> pd.DataFrame:
 # INGEST — whole run, one target at a time using Test12.py pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _compute_target(args: dict) -> dict:
+    """
+    Pure compute worker — runs the full pipeline for one target and returns
+    all results as a dict. No database writes. Safe to run in a subprocess.
+    """
+    import gzip, shutil, tempfile
+    from pathlib import Path
+    from collections import defaultdict
+    from Bio import SeqIO
+    from Bio.Seq import Seq
+    import pandas as pd
+
+    run_id      = args["run_id"]
+    target      = args["target"]
+    control_dir = Path(args["control_dir"]) if args.get("control_dir") else None
+    onex_dir    = Path(args["onex_dir"])    if args.get("onex_dir")    else None
+    twox_dir    = Path(args["twox_dir"])    if args.get("twox_dir")    else None
+    START       = args["START"]
+    END         = args["END"]
+    LENGTH      = args["LENGTH"]
+    mm_min_seq_id  = args["mm_min_seq_id"]
+    mm_coverage    = args["mm_coverage"]
+    mm_cov_mode    = args["mm_cov_mode"]
+    use_linclust   = args["use_linclust"]
+    drop_unclustered = args["drop_unclustered"]
+
+    logs = []
+    def log(msg):
+        logs.append(f"  [{target}] {msg}")
+
+    try:
+        control_files = find_fastq_files(control_dir) if control_dir else []
+        one_x_files   = find_fastq_files(onex_dir)    if onex_dir   else []
+        two_x_files   = find_fastq_files(twox_dir)    if twox_dir   else []
+
+        if not control_files and one_x_files and two_x_files:
+            log("No TG1 — using R1 as control, R2 as 1xpanned")
+            control_dir = onex_dir; control_files = one_x_files
+            onex_dir = twox_dir;    one_x_files   = two_x_files
+            twox_dir = None;        two_x_files   = []
+        elif not control_files and one_x_files:
+            log("No TG1 and only R1 — skipping")
+            return {"target": target, "skipped": True, "logs": logs}
+
+        all_inputs = control_files + one_x_files + two_x_files
+        if not all_inputs:
+            log("No FASTQ files — skipping")
+            return {"target": target, "skipped": True, "logs": logs}
+
+        log("Counting reads...")
+        total_reads_control  = count_fastq_records(control_files)
+        total_reads_1xpanned = count_fastq_records(one_x_files)
+        total_reads_2xpanned = count_fastq_records(two_x_files)
+        log(f"control={total_reads_control:,}  1x={total_reads_1xpanned:,}  2x={total_reads_2xpanned:,}")
+
+        with tempfile.TemporaryDirectory(prefix=f"nb_{target}_") as tmp:
+            tmp_path       = Path(tmp)
+            trimmed_fasta  = tmp_path / "trimmed_proteins.fasta"
+            filtered_fasta = tmp_path / "filtered.fasta"
+            cluster_prefix = tmp_path / "clusters"
+            cluster_tmp    = tmp_path / "mmseqs_tmp"
+            cluster_tsv    = tmp_path / "clusters_cluster.tsv"
+
+            log("Translating per-barcode sequences...")
+            barcode_raw_seqs = {}
+            all_lib_paths = {}
+            if control_dir: all_lib_paths["control"]   = control_dir
+            if onex_dir:    all_lib_paths["1xpanned"]  = onex_dir
+            if twox_dir:    all_lib_paths["2xpanned"]  = twox_dir
+
+            per_barcode_fastas = {}
+            for lib_id, lib_path in all_lib_paths.items():
+                seq_counts = {}
+                bc_fasta = tmp_path / f"trimmed_{lib_id}.fasta"
+                with open(bc_fasta, "w") as bc_out:
+                    for fq in find_fastq_files(lib_path):
+                        opener = gzip.open(fq, "rt") if str(fq).endswith(".gz") else open(fq, "rt")
+                        with opener as handle:
+                            for record in SeqIO.parse(handle, "fastq"):
+                                seq_str = str(record.seq).upper()
+                                s_idx = seq_str.find(START)
+                                e_idx = seq_str.find(END)
+                                if s_idx == -1 or e_idx == -1 or e_idx <= s_idx:
+                                    continue
+                                sub = seq_str[s_idx: e_idx + len(END)]
+                                codon_len = (len(sub) // 3) * 3
+                                prot = str(Seq(sub[:codon_len]).translate(to_stop=False))
+                                if len(prot) < LENGTH or "*" in prot[:LENGTH]:
+                                    continue
+                                seq_counts[prot] = seq_counts.get(prot, 0) + 1
+                                bc_out.write(f">{record.id}\n{prot}\n")
+                barcode_raw_seqs[lib_id] = seq_counts
+                per_barcode_fastas[lib_id] = bc_fasta
+                log(f"  {lib_id}: {sum(seq_counts.values()):,} passing, {len(seq_counts):,} unique")
+
+            log("Combining translated FASTAs...")
+            with open(trimmed_fasta, "w") as combined_out:
+                for bc_fasta in per_barcode_fastas.values():
+                    with open(bc_fasta) as f_in:
+                        shutil.copyfileobj(f_in, combined_out)
+
+            log(f"Filtering (min AA length={LENGTH})...")
+            kept6, discarded6 = filter_aa_fasta(trimmed_fasta, filtered_fasta, LENGTH=int(LENGTH))
+            kept5 = kept6 + discarded6
+            log(f"Kept {kept6:,}, discarded {discarded6:,}")
+
+            if kept6 <= 0:
+                log("No sequences passed filtering — skipping.")
+                return {"target": target, "skipped": True, "logs": logs}
+
+            raw_seq_rows = []
+            for lib_id, seq_counts in barcode_raw_seqs.items():
+                for aa_seq, count in seq_counts.items():
+                    raw_seq_rows.append((run_id, target, lib_id, aa_seq, len(aa_seq), count))
+
+            mode_str = "easy-linclust" if use_linclust else "easy-cluster"
+            log(f"Clustering with MMseqs2 {mode_str}...")
+            run_mmseqs_easy_cluster(
+                filtered_fasta, cluster_prefix, cluster_tmp,
+                min_seq_id=mm_min_seq_id, coverage=mm_coverage,
+                cov_mode=mm_cov_mode, use_linclust=use_linclust,
+            )
+            if not cluster_tsv.exists():
+                log("Cluster TSV not found — skipping")
+                return {"target": target, "skipped": True, "logs": logs}
+            log("Clustering complete")
+
+            log("Building count matrix...")
+            lib_paths = {"control": control_dir}
+            if onex_dir: lib_paths["1xpanned"] = onex_dir
+            if twox_dir: lib_paths["2xpanned"]  = twox_dir
+            cluster_counts_df, count_matrix = build_cluster_counts_and_matrix(
+                library_paths=lib_paths,
+                cluster_tsv=cluster_tsv,
+                drop_unclustered=drop_unclustered,
+            )
+            for col in ["control", "1xpanned", "2xpanned"]:
+                if col not in count_matrix.columns:
+                    count_matrix[col] = 0
+
+            log("Normalizing...")
+            count_matrix["control_norm"] = count_matrix["control"].astype(float).round(0).astype("Int64")
+            if total_reads_control > 0 and total_reads_1xpanned > 0:
+                count_matrix["1xpanned_norm"] = (
+                    count_matrix["1xpanned"].astype(float)
+                    * (float(total_reads_control) / float(total_reads_1xpanned))
+                ).round(0).astype("Int64")
+            else:
+                count_matrix["1xpanned_norm"] = pd.Series([pd.NA]*len(count_matrix), dtype="Int64")
+            if total_reads_control > 0 and total_reads_2xpanned > 0:
+                count_matrix["2xpanned_norm"] = (
+                    count_matrix["2xpanned"].astype(float)
+                    * (float(total_reads_control) / float(total_reads_2xpanned))
+                ).round(0).astype("Int64")
+            else:
+                count_matrix["2xpanned_norm"] = pd.Series([pd.NA]*len(count_matrix), dtype="Int64")
+
+            count_matrix = count_matrix.sort_values(
+                by="2xpanned_norm", ascending=False, kind="mergesort", na_position="last"
+            ).reset_index(drop=True)
+
+            n_clusters = len(count_matrix)
+            log(f"{n_clusters:,} clusters")
+
+            log("Fetching AA sequences...")
+            all_heads = count_matrix["cluster_head"].astype(str).tolist()
+            seq_map = fetch_fasta_sequences_by_id(filtered_fasta, all_heads)
+
+            # Prepare DB rows
+            count_rows = []
+            for _, row in count_matrix.iterrows():
+                ch = str(row["cluster_head"])
+                for lib, norm_col in [("control","control_norm"),("1xpanned","1xpanned_norm"),("2xpanned","2xpanned_norm")]:
+                    raw = int(row.get(lib, 0) or 0)
+                    nv  = row.get(norm_col, raw)
+                    norm = float(nv) if nv is not pd.NA and nv is not None else float(raw)
+                    count_rows.append((run_id, target, ch, lib, raw, norm))
+
+            seq_rows = [(run_id, target, ch, seq, len(seq)) for ch, seq in seq_map.items()]
+
+            return {
+                "run_id": run_id,
+                "target": target,
+                "skipped": False,
+                "logs": logs,
+                "control_dir": str(control_dir) if control_dir else None,
+                "onex_dir":    str(onex_dir)    if onex_dir    else None,
+                "twox_dir":    str(twox_dir)    if twox_dir    else None,
+                "total_reads_control":  total_reads_control,
+                "total_reads_1xpanned": total_reads_1xpanned,
+                "total_reads_2xpanned": total_reads_2xpanned,
+                "kept5": kept5,
+                "kept6": kept6,
+                "n_clusters": n_clusters,
+                "count_rows": count_rows,
+                "seq_rows": seq_rows,
+                "raw_seq_rows": raw_seq_rows,
+            }
+
+    except Exception as e:
+        import traceback
+        logs.append(f"  [{target}] ERROR: {e}\n{traceback.format_exc()}")
+        return {"target": target, "skipped": True, "error": str(e), "logs": logs}
+
+
 def ingest_target(
     conn: sqlite3.Connection,
     run_id: str,
@@ -1476,207 +1683,61 @@ def ingest_target(
     drop_unclustered: bool,
     progress_cb=None,
 ):
-    """Run Test12.py pipeline for one target group and store results."""
+    """Sequential wrapper around _compute_target — used as fallback."""
     def log(msg):
         if progress_cb:
-            progress_cb(f"  [{target}] {msg}")
+            progress_cb(msg)
 
-    control_files = find_fastq_files(control_dir) if control_dir else []
-    one_x_files   = find_fastq_files(onex_dir)    if onex_dir   else []
-    two_x_files   = find_fastq_files(twox_dir)    if twox_dir   else []
+    result = _compute_target({
+        "run_id": run_id, "target": target,
+        "control_dir": str(control_dir) if control_dir else None,
+        "onex_dir":    str(onex_dir)    if onex_dir    else None,
+        "twox_dir":    str(twox_dir)    if twox_dir    else None,
+        "START": START, "END": END, "LENGTH": LENGTH,
+        "mm_min_seq_id": mm_min_seq_id, "mm_coverage": mm_coverage,
+        "mm_cov_mode": mm_cov_mode, "use_linclust": use_linclust,
+        "drop_unclustered": drop_unclustered,
+    })
 
-    # If no TG1, use R1 as control and R2 as 1xpanned
-    if not control_files and one_x_files and two_x_files:
-        log("No TG1 — using R1 as control, R2 as 1xpanned")
-        control_dir   = onex_dir
-        control_files = one_x_files
-        onex_dir      = twox_dir
-        one_x_files   = two_x_files
-        twox_dir      = None
-        two_x_files   = []
-    elif not control_files and one_x_files:
-        log("No TG1 and only R1 — skipping (need at least 2 rounds)")
+    for msg in result.get("logs", []):
+        log(msg)
+
+    if result.get("skipped"):
         return
 
-    all_inputs = control_files + one_x_files + two_x_files
-    if not all_inputs:
-        log("No FASTQ files found — skipping")
-        return
+    _write_target_to_db(conn, result)
+    log(f"  [{target}] Done ✅")
 
-    with tempfile.TemporaryDirectory(prefix=f"nb_{target}_") as tmp:
-        tmp_path       = Path(tmp)
-        combined_fastq = tmp_path / "combined.fastq"
-        trimmed_fasta  = tmp_path / "trimmed_proteins.fasta"
-        filtered_fasta = tmp_path / "filtered.fasta"
-        cluster_prefix = tmp_path / "clusters"
-        cluster_tmp    = tmp_path / "mmseqs_tmp"
-        cluster_tsv    = tmp_path / "clusters_cluster.tsv"
 
-        # Count reads (Test12.py)
-        log("Counting reads...")
-        total_reads_control  = count_fastq_records(control_files)
-        total_reads_1xpanned = count_fastq_records(one_x_files)
-        total_reads_2xpanned = count_fastq_records(two_x_files)
-        log(f"control={total_reads_control:,}  1x={total_reads_1xpanned:,}  2x={total_reads_2xpanned:,}")
-
-        # Store pre-clustering sequences — single pass per barcode (no re-reading FASTQs)
-        # Instead of re-translating, we translate each barcode individually before combining
-        log("Translating per-barcode sequences (for sticky detection + clustering)...")
-        barcode_raw_seqs: Dict[str, Dict[str, int]] = {}
-        all_lib_paths = {}
-        if control_dir: all_lib_paths["control"] = control_dir
-        if onex_dir:    all_lib_paths["1xpanned"] = onex_dir
-        if twox_dir:    all_lib_paths["2xpanned"] = twox_dir
-
-        per_barcode_fastas: Dict[str, Path] = {}
-
-        for lib_id, lib_path in all_lib_paths.items():
-            seq_counts: Dict[str, int] = {}
-            bc_fasta = tmp_path / f"trimmed_{lib_id}.fasta"
-            with open(bc_fasta, "w") as bc_out:
-                for fq in find_fastq_files(lib_path):
-                    opener = gzip.open(fq, "rt") if str(fq).endswith(".gz") else open(fq, "rt")
-                    with opener as handle:
-                        for record in SeqIO.parse(handle, "fastq"):
-                            seq_str = str(record.seq).upper()
-                            start_idx = seq_str.find(START)
-                            end_idx = seq_str.find(END)
-                            if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
-                                continue
-                            sub = seq_str[start_idx: end_idx + len(END)]
-                            codon_len = (len(sub) // 3) * 3
-                            prot = str(Seq(sub[:codon_len]).translate(to_stop=False))
-                            if len(prot) < LENGTH or "*" in prot[:LENGTH]:
-                                continue
-                            seq_counts[prot] = seq_counts.get(prot, 0) + 1
-                            bc_out.write(f">{record.id}\n{prot}\n")
-            barcode_raw_seqs[lib_id] = seq_counts
-            per_barcode_fastas[lib_id] = bc_fasta
-            log(f"  {lib_id}: {sum(seq_counts.values()):,} passing reads, {len(seq_counts):,} unique sequences")
-
-        # Combine per-barcode FASTAs into one for MMseqs2 (replaces trim_translate step)
-        log("Combining translated FASTAs...")
-        with open(trimmed_fasta, "w") as combined_out:
-            for bc_fasta in per_barcode_fastas.values():
-                with open(bc_fasta) as f_in:
-                    shutil.copyfileobj(f_in, combined_out)
-
-        # Filter combined FASTA (Test12.py)
-        log(f"Filtering (min AA length={LENGTH})...")
-        kept6, discarded6 = filter_aa_fasta(trimmed_fasta, filtered_fasta, LENGTH=int(LENGTH))
-        kept5 = kept6 + discarded6
-        discarded5 = total_reads_control + total_reads_1xpanned + total_reads_2xpanned - kept5
-        log(f"Kept {kept6:,}, discarded {discarded6:,}")
-
-        if kept6 <= 0:
-            log("No sequences passed filtering — skipping. Check START/END anchors.")
-            return
-
-        # Store raw sequences for sticky detection
-        raw_seq_rows = []
-        for lib_id, seq_counts in barcode_raw_seqs.items():
-            for aa_seq, count in seq_counts.items():
-                raw_seq_rows.append((run_id, target, lib_id, aa_seq, len(aa_seq), count))
-        with conn:
-            conn.executemany(
-                """INSERT OR REPLACE INTO raw_sequences
-                   (run_id, target, barcode, aa_sequence, aa_length, read_count)
-                   VALUES (?,?,?,?,?,?)""",
-                raw_seq_rows
-            )
-        log(f"  → {len(raw_seq_rows):,} unique barcode-sequence pairs stored")
-
-        # Cluster (Test12.py)
-        mode_str = "easy-linclust" if use_linclust else "easy-cluster"
-        log(f"Clustering with MMseqs2 {mode_str}...")
-        run_mmseqs_easy_cluster(
-            filtered_fasta, cluster_prefix, cluster_tmp,
-            min_seq_id=mm_min_seq_id, coverage=mm_coverage,
-            cov_mode=mm_cov_mode, use_linclust=use_linclust,
+def _write_target_to_db(conn: sqlite3.Connection, result: dict):
+    """Write computed target results to the database."""
+    run_id = result["run_id"]
+    target = result["target"]
+    with conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO target_run
+               (run_id, target, control_path, onex_path, twox_path,
+                total_reads_control, total_reads_1xpanned, total_reads_2xpanned,
+                kept_trimmed, kept_filtered, n_clusters)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (run_id, target,
+             result["control_dir"], result["onex_dir"], result["twox_dir"],
+             result["total_reads_control"], result["total_reads_1xpanned"], result["total_reads_2xpanned"],
+             result["kept5"], result["kept6"], result["n_clusters"])
         )
-        if not cluster_tsv.exists():
-            log("Cluster TSV not found — skipping")
-            return
-        log("Clustering complete")
-
-        # Count matrix (Test12.py)
-        log("Building count matrix...")
-        lib_paths = {"control": control_dir}
-        if onex_dir:  lib_paths["1xpanned"] = onex_dir
-        if twox_dir:  lib_paths["2xpanned"] = twox_dir
-        cluster_counts_df, count_matrix = build_cluster_counts_and_matrix(
-            library_paths=lib_paths,
-            cluster_tsv=cluster_tsv,
-            drop_unclustered=drop_unclustered,
+        conn.executemany(
+            "INSERT OR REPLACE INTO cluster_counts (run_id,target,cluster_head,library_id,raw_count,norm_count) VALUES (?,?,?,?,?,?)",
+            result["count_rows"]
         )
-        for col in ["control", "1xpanned", "2xpanned"]:
-            if col not in count_matrix.columns:
-                count_matrix[col] = 0
+        conn.executemany(
+            "INSERT OR IGNORE INTO cluster_sequences (run_id,target,cluster_head,aa_sequence,aa_length) VALUES (?,?,?,?,?)",
+            result["seq_rows"]
+        )
+        conn.executemany(
+            "INSERT OR REPLACE INTO raw_sequences (run_id,target,barcode,aa_sequence,aa_length,read_count) VALUES (?,?,?,?,?,?)",
+            result["raw_seq_rows"]
+        )
 
-        # Normalize (Test12.py — exact formula)
-        log("Normalizing...")
-        count_matrix["control_norm"] = count_matrix["control"].astype(float).round(0).astype("Int64")
-        if total_reads_control > 0 and total_reads_1xpanned > 0:
-            count_matrix["1xpanned_norm"] = (
-                count_matrix["1xpanned"].astype(float)
-                * (float(total_reads_control) / float(total_reads_1xpanned))
-            ).round(0).astype("Int64")
-        else:
-            count_matrix["1xpanned_norm"] = pd.Series([pd.NA]*len(count_matrix), dtype="Int64")
-        if total_reads_control > 0 and total_reads_2xpanned > 0:
-            count_matrix["2xpanned_norm"] = (
-                count_matrix["2xpanned"].astype(float)
-                * (float(total_reads_control) / float(total_reads_2xpanned))
-            ).round(0).astype("Int64")
-        else:
-            count_matrix["2xpanned_norm"] = pd.Series([pd.NA]*len(count_matrix), dtype="Int64")
-
-        count_matrix = count_matrix.sort_values(
-            by="2xpanned_norm", ascending=False, kind="mergesort", na_position="last"
-        ).reset_index(drop=True)
-
-        n_clusters = len(count_matrix)
-        log(f"{n_clusters:,} clusters")
-
-        # Fetch sequences (Test12.py)
-        log("Fetching AA sequences...")
-        all_heads = count_matrix["cluster_head"].astype(str).tolist()
-        seq_map = fetch_fasta_sequences_by_id(filtered_fasta, all_heads)
-
-        # Store
-        log("Saving to database...")
-        with conn:
-            conn.execute(
-                """INSERT OR REPLACE INTO target_run
-                   (run_id, target, control_path, onex_path, twox_path,
-                    total_reads_control, total_reads_1xpanned, total_reads_2xpanned,
-                    kept_trimmed, kept_filtered, n_clusters)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (run_id, target,
-                 str(control_dir) if control_dir else None,
-                 str(onex_dir)    if onex_dir    else None,
-                 str(twox_dir)    if twox_dir    else None,
-                 total_reads_control, total_reads_1xpanned, total_reads_2xpanned,
-                 kept5, kept6, n_clusters)
-            )
-            count_rows = []
-            for _, row in count_matrix.iterrows():
-                ch = str(row["cluster_head"])
-                for lib, norm_col in [("control","control_norm"),("1xpanned","1xpanned_norm"),("2xpanned","2xpanned_norm")]:
-                    raw = int(row.get(lib, 0) or 0)
-                    nv  = row.get(norm_col, raw)
-                    norm = float(nv) if nv is not pd.NA and nv is not None else float(raw)
-                    count_rows.append((run_id, target, ch, lib, raw, norm))
-            conn.executemany(
-                "INSERT OR REPLACE INTO cluster_counts (run_id,target,cluster_head,library_id,raw_count,norm_count) VALUES (?,?,?,?,?,?)",
-                count_rows
-            )
-            seq_rows = [(run_id, target, ch, seq, len(seq)) for ch, seq in seq_map.items()]
-            conn.executemany(
-                "INSERT OR IGNORE INTO cluster_sequences (run_id,target,cluster_head,aa_sequence,aa_length) VALUES (?,?,?,?,?)",
-                seq_rows
-            )
-        log(f"Done ✅")
 
 
 def ingest_run(
@@ -1747,37 +1808,64 @@ def ingest_run(
              len(groups), now)
         )
 
-    # Process each target
+    # Build args list for each target
+    target_args = []
     for target, grp in sorted(groups.items()):
         if target in skip_targets:
             log(f"\nSkipping target: {target} (excluded by user)")
             continue
-        log(f"\nProcessing target: {target}")
         tg1_info = grp["tg1"]
         rounds   = grp["rounds"]
-
         target_overrides = (ext_overrides or {}).get(target, {})
         control_dir = Path(tg1_info["folder_path"]) if tg1_info else (
             target_overrides.get("tg1") or (ext_tg1_dir if ext_tg1_dir else None))
-        onex_dir    = Path(rounds[1]["folder_path"]) if 1 in rounds else target_overrides.get("r1")
-        twox_dir    = Path(rounds[2]["folder_path"]) if 2 in rounds else target_overrides.get("r2")
-
+        onex_dir = Path(rounds[1]["folder_path"]) if 1 in rounds else target_overrides.get("r1")
+        twox_dir = Path(rounds[2]["folder_path"]) if 2 in rounds else target_overrides.get("r2")
         if not onex_dir and not twox_dir:
             log(f"  [{target}] No panning rounds found — skipping")
             continue
+        target_args.append({
+            "run_id": run_id, "target": target,
+            "control_dir": str(control_dir) if control_dir else None,
+            "onex_dir":    str(onex_dir)    if onex_dir    else None,
+            "twox_dir":    str(twox_dir)    if twox_dir    else None,
+            "START": START, "END": END, "LENGTH": LENGTH,
+            "mm_min_seq_id": mm_min_seq_id, "mm_coverage": mm_coverage,
+            "mm_cov_mode": mm_cov_mode, "use_linclust": use_linclust,
+            "drop_unclustered": drop_unclustered,
+        })
 
+    if not target_args:
+        log("No targets to process.")
+        conn.close()
+        return run_id
+
+    # Run targets in parallel — use min(n_targets, cpu_count-1) workers
+    n_workers = min(len(target_args), max(1, (os.cpu_count() or 2) - 1))
+    log(f"\nProcessing {len(target_args)} target(s) in parallel ({n_workers} workers)...")
+
+    if n_workers == 1 or len(target_args) == 1:
+        # Single target — run directly (no multiprocessing overhead)
+        results = [_compute_target(args) for args in target_args]
+    else:
+        # Multiple targets — run in parallel
+        with mp.Pool(processes=n_workers) as pool:
+            results = pool.map(_compute_target, target_args)
+
+    # Write results to DB sequentially (safe — no concurrent writes)
+    log("\nAll targets computed. Writing to database...")
+    for result in results:
+        for msg in result.get("logs", []):
+            log(msg)
+        if result.get("skipped"):
+            if result.get("error"):
+                log(f"  [{result['target']}] ERROR: {result['error']}")
+            continue
         try:
-            ingest_target(
-                conn=conn, run_id=run_id, target=target,
-                control_dir=control_dir, onex_dir=onex_dir, twox_dir=twox_dir,
-                START=START, END=END, LENGTH=LENGTH,
-                mm_min_seq_id=mm_min_seq_id, mm_coverage=mm_coverage,
-                mm_cov_mode=mm_cov_mode, use_linclust=use_linclust,
-                drop_unclustered=drop_unclustered,
-                progress_cb=progress_cb,
-            )
+            _write_target_to_db(conn, result)
+            log(f"  [{result['target']}] Saved ✅")
         except Exception as e:
-            log(f"  [{target}] ERROR: {e}")
+            log(f"  [{result['target']}] DB write ERROR: {e}")
 
     log(f"\n✅ Ingest complete. Run ID: {run_id}")
     conn.close()
