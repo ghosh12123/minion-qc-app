@@ -1429,6 +1429,12 @@ CREATE TABLE IF NOT EXISTS raw_sequences (
   read_count    INTEGER,
   PRIMARY KEY (run_id, target, barcode, aa_sequence)
 );
+
+-- Indexes for performance
+CREATE INDEX IF NOT EXISTS idx_raw_sequences_aa ON raw_sequences(aa_sequence);
+CREATE INDEX IF NOT EXISTS idx_raw_sequences_run ON raw_sequences(run_id);
+CREATE INDEX IF NOT EXISTS idx_cluster_counts_run_target ON cluster_counts(run_id, target);
+CREATE INDEX IF NOT EXISTS idx_cluster_sequences_run_target ON cluster_sequences(run_id, target);
 """
 
 
@@ -1513,59 +1519,64 @@ def ingest_target(
         total_reads_2xpanned = count_fastq_records(two_x_files)
         log(f"control={total_reads_control:,}  1x={total_reads_1xpanned:,}  2x={total_reads_2xpanned:,}")
 
-        # Combine (Test12.py)
-        log("Combining FASTQs...")
-        combine_fastqs(all_inputs, combined_fastq)
-
-        # Trim + translate (Test12.py)
-        log(f"Trimming (START={START}, END={END}) and translating...")
-        kept5, discarded5 = trim_translate_fastq_to_fasta(combined_fastq, trimmed_fasta, START=START, END=END)
-        log(f"Kept {kept5:,}, discarded {discarded5:,}")
-
-        # Filter (Test12.py)
-        log(f"Filtering (min AA length={LENGTH})...")
-        kept6, discarded6 = filter_aa_fasta(trimmed_fasta, filtered_fasta, LENGTH=int(LENGTH))
-        log(f"Kept {kept6:,}, discarded {discarded6:,}")
-
-        if kept6 <= 0:
-            log("No sequences passed filtering — skipping. Check START/END anchors.")
-            return
-
-        # Store pre-clustering sequences for sticky sequence detection
-        log("Storing pre-clustering sequences...")
-        raw_seq_rows = []
-        # Parse filtered_fasta and map read_ids back to barcodes via cluster count method
-        # We store unique AA sequences per barcode using the combined filtered FASTA
-        # Since we have per-barcode FASTQ files, we re-translate them individually
+        # Store pre-clustering sequences — single pass per barcode (no re-reading FASTQs)
+        # Instead of re-translating, we translate each barcode individually before combining
+        log("Translating per-barcode sequences (for sticky detection + clustering)...")
         barcode_raw_seqs: Dict[str, Dict[str, int]] = {}
         all_lib_paths = {}
         if control_dir: all_lib_paths["control"] = control_dir
         if onex_dir:    all_lib_paths["1xpanned"] = onex_dir
         if twox_dir:    all_lib_paths["2xpanned"] = twox_dir
 
+        per_barcode_fastas: Dict[str, Path] = {}
+
         for lib_id, lib_path in all_lib_paths.items():
             seq_counts: Dict[str, int] = {}
-            for fq in find_fastq_files(lib_path):
-                opener = gzip.open(fq, "rt") if str(fq).endswith(".gz") else open(fq, "rt")
-                with opener as handle:
-                  for record in SeqIO.parse(handle, "fastq"):
-                    seq_str = str(record.seq).upper()
-                    start_idx = seq_str.find(START)
-                    end_idx = seq_str.find(END)
-                    if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
-                        continue
-                    sub = seq_str[start_idx: end_idx + len(END)]
-                    codon_len = (len(sub) // 3) * 3
-                    prot = str(Seq(sub[:codon_len]).translate(to_stop=False))
-                    if len(prot) < LENGTH or "*" in prot[:LENGTH]:
-                        continue
-                    seq_counts[prot] = seq_counts.get(prot, 0) + 1
+            bc_fasta = tmp_path / f"trimmed_{lib_id}.fasta"
+            with open(bc_fasta, "w") as bc_out:
+                for fq in find_fastq_files(lib_path):
+                    opener = gzip.open(fq, "rt") if str(fq).endswith(".gz") else open(fq, "rt")
+                    with opener as handle:
+                        for record in SeqIO.parse(handle, "fastq"):
+                            seq_str = str(record.seq).upper()
+                            start_idx = seq_str.find(START)
+                            end_idx = seq_str.find(END)
+                            if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+                                continue
+                            sub = seq_str[start_idx: end_idx + len(END)]
+                            codon_len = (len(sub) // 3) * 3
+                            prot = str(Seq(sub[:codon_len]).translate(to_stop=False))
+                            if len(prot) < LENGTH or "*" in prot[:LENGTH]:
+                                continue
+                            seq_counts[prot] = seq_counts.get(prot, 0) + 1
+                            bc_out.write(f">{record.id}\n{prot}\n")
             barcode_raw_seqs[lib_id] = seq_counts
+            per_barcode_fastas[lib_id] = bc_fasta
+            log(f"  {lib_id}: {sum(seq_counts.values()):,} passing reads, {len(seq_counts):,} unique sequences")
 
+        # Combine per-barcode FASTAs into one for MMseqs2 (replaces trim_translate step)
+        log("Combining translated FASTAs...")
+        with open(trimmed_fasta, "w") as combined_out:
+            for bc_fasta in per_barcode_fastas.values():
+                with open(bc_fasta) as f_in:
+                    shutil.copyfileobj(f_in, combined_out)
+
+        # Filter combined FASTA (Test12.py)
+        log(f"Filtering (min AA length={LENGTH})...")
+        kept6, discarded6 = filter_aa_fasta(trimmed_fasta, filtered_fasta, LENGTH=int(LENGTH))
+        kept5 = kept6 + discarded6
+        discarded5 = total_reads_control + total_reads_1xpanned + total_reads_2xpanned - kept5
+        log(f"Kept {kept6:,}, discarded {discarded6:,}")
+
+        if kept6 <= 0:
+            log("No sequences passed filtering — skipping. Check START/END anchors.")
+            return
+
+        # Store raw sequences for sticky detection
+        raw_seq_rows = []
         for lib_id, seq_counts in barcode_raw_seqs.items():
             for aa_seq, count in seq_counts.items():
                 raw_seq_rows.append((run_id, target, lib_id, aa_seq, len(aa_seq), count))
-
         with conn:
             conn.executemany(
                 """INSERT OR REPLACE INTO raw_sequences
@@ -1785,76 +1796,99 @@ def find_sticky_sequences(
     similarity_threshold: float = 1.0,
 ) -> Dict[str, List[dict]]:
     """
-    For each cluster_head sequence, check if it appears in raw_sequences
-    from ANY other run (regardless of target).
-    Returns {aa_sequence: [{"run_id": ..., "target": ..., "barcode": ..., "read_count": ...}, ...]}
-    Only sequences that appear in other runs are included.
-    similarity_threshold=1.0 means exact match (default).
+    Check if cluster head sequences appear in raw_sequences from ANY other run.
+    Uses a single batched SQL query for exact match (default).
+    Returns {cluster_head: [{"run_id":..., "run_name":..., "target":..., "barcode":..., "read_count":...}]}
     """
     if not cluster_heads:
         return {}
 
-    # Get AA sequences for these cluster heads
+    # Get AA sequences for all cluster heads in one query
     placeholders = ",".join(["?"] * len(cluster_heads))
     seqs_df = sql_df(conn,
-        f"SELECT cluster_head, aa_sequence FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
+        f"SELECT cluster_head, aa_sequence FROM cluster_sequences "
+        f"WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
         (run_id, target, *cluster_heads))
 
     if seqs_df.empty:
         return {}
 
+    aa_to_cluster: Dict[str, str] = dict(zip(seqs_df["aa_sequence"], seqs_df["cluster_head"]))
+    all_seqs = [s for s in aa_to_cluster.keys() if s]
+
+    if not all_seqs:
+        return {}
+
     results: Dict[str, List[dict]] = {}
 
-    for _, row in seqs_df.iterrows():
-        aa_seq = row["aa_sequence"]
-        if not aa_seq:
-            continue
+    if similarity_threshold >= 1.0:
+        # BATCHED exact match — single query for all sequences
+        seq_placeholders = ",".join(["?"] * len(all_seqs))
+        matches_df = sql_df(conn,
+            f"SELECT aa_sequence, run_id, target, barcode, read_count "
+            f"FROM raw_sequences "
+            f"WHERE aa_sequence IN ({seq_placeholders}) AND run_id != ?",
+            (*all_seqs, run_id))
 
-        if similarity_threshold >= 1.0:
-            # Exact match
-            matches = sql_df(conn,
-                """SELECT run_id, target, barcode, read_count
-                   FROM raw_sequences
-                   WHERE aa_sequence=? AND run_id != ?""",
-                (aa_seq, run_id))
-        else:
-            # Approximate match using length filter as pre-screen
+        if not matches_df.empty:
+            # Fetch run names in one query
+            other_run_ids = matches_df["run_id"].unique().tolist()
+            run_id_placeholders = ",".join(["?"] * len(other_run_ids))
+            run_names_df = sql_df(conn,
+                f"SELECT run_id, sample_id FROM run WHERE run_id IN ({run_id_placeholders})",
+                tuple(other_run_ids))
+            run_names = dict(zip(run_names_df["run_id"], run_names_df["sample_id"])) if not run_names_df.empty else {}
+
+            for aa_seq, grp in matches_df.groupby("aa_sequence"):
+                ch = aa_to_cluster.get(aa_seq)
+                if not ch:
+                    continue
+                hit_list = []
+                for _, m in grp.iterrows():
+                    hit_list.append({
+                        "run_id": m["run_id"],
+                        "run_name": run_names.get(m["run_id"], m["run_id"][:8]),
+                        "target": m["target"],
+                        "barcode": m["barcode"],
+                        "read_count": int(m["read_count"]),
+                    })
+                results[ch] = hit_list
+    else:
+        # Approximate match — per-sequence with length pre-filter
+        def seq_identity(a: str, b: str) -> float:
+            m = sum(ca == cb for ca, cb in zip(a, b))
+            return m / max(len(a), len(b))
+
+        # Fetch run names once
+        run_names_df = sql_df(conn, "SELECT run_id, sample_id FROM run WHERE run_id != ?", (run_id,))
+        run_names = dict(zip(run_names_df["run_id"], run_names_df["sample_id"])) if not run_names_df.empty else {}
+
+        for aa_seq, ch in aa_to_cluster.items():
             min_len = int(len(aa_seq) * similarity_threshold)
             max_len = int(len(aa_seq) / similarity_threshold) + 1
             candidates = sql_df(conn,
-                """SELECT run_id, target, barcode, aa_sequence, read_count
-                   FROM raw_sequences
-                   WHERE aa_length BETWEEN ? AND ? AND run_id != ?""",
+                "SELECT run_id, target, barcode, aa_sequence, read_count "
+                "FROM raw_sequences WHERE aa_length BETWEEN ? AND ? AND run_id != ?",
                 (min_len, max_len, run_id))
             if candidates.empty:
                 continue
-            # Filter by actual identity
-            def seq_identity(a: str, b: str) -> float:
-                matches = sum(ca == cb for ca, cb in zip(a, b))
-                return matches / max(len(a), len(b))
             mask = candidates["aa_sequence"].apply(lambda s: seq_identity(aa_seq, s) >= similarity_threshold)
-            matches = candidates[mask][["run_id", "target", "barcode", "read_count"]]
-
-        if not matches.empty:
-            # Get sample_id for each run for readable display
-            run_ids = matches["run_id"].unique().tolist()
-            run_names = {}
-            for rid in run_ids:
-                r = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (rid,)).fetchone()
-                run_names[rid] = r[0] if r else rid[:8]
-
-            hit_list = []
-            for _, m in matches.iterrows():
-                hit_list.append({
-                    "run_id": m["run_id"],
-                    "run_name": run_names.get(m["run_id"], m["run_id"][:8]),
-                    "target": m["target"],
-                    "barcode": m["barcode"],
-                    "read_count": int(m["read_count"]),
-                })
-            results[row["cluster_head"]] = hit_list
+            matches = candidates[mask]
+            if not matches.empty:
+                hit_list = []
+                for _, m in matches.iterrows():
+                    hit_list.append({
+                        "run_id": m["run_id"],
+                        "run_name": run_names.get(m["run_id"], m["run_id"][:8]),
+                        "target": m["target"],
+                        "barcode": m["barcode"],
+                        "read_count": int(m["read_count"]),
+                    })
+                results[ch] = hit_list
 
     return results
+
+
 
 
 def load_count_matrix(conn: sqlite3.Connection, run_id: str, target: str) -> pd.DataFrame:
