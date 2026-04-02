@@ -1,8 +1,5 @@
 """
-MinION Nanobody Analysis — v2
-Ingest a full run folder — auto-detects all targets and runs the Test12.py
-pipeline (trim+translate, easy-cluster, normalize) for each target group.
-Results stored in SQLite. One ingest, all targets, instant reload.
+MinION Nanobody Analysis 
 """
 
 import gzip
@@ -38,12 +35,6 @@ from Bio.Align import MultipleSeqAlignment
 from Bio.SeqRecord import SeqRecord
 import matplotlib.colors as mcolors
 from plotly.subplots import make_subplots
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ALL FUNCTIONS BELOW TAKEN DIRECTLY FROM Test12.py — DO NOT MODIFY LOGIC
-# ═══════════════════════════════════════════════════════════════════════════════
-
 
 # -----------------------------
 # Helpers (folders / names)
@@ -408,6 +399,50 @@ def build_cluster_counts_and_matrix(
 
     return cluster_counts, count_matrix
 
+def build_cluster_counts_from_map(
+    read_id_to_barcode: Dict[str, str],
+    cluster_tsv: Path,
+    drop_unclustered: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Optimized version of build_cluster_counts_and_matrix.
+    Uses a pre-built {read_id: library_id} map instead of re-reading FASTQs.
+    Produces identical output to the original function.
+    """
+    if not cluster_tsv.exists():
+        raise FileNotFoundError(f"Cluster TSV not found: {cluster_tsv}")
+
+    cluster_all = pd.read_csv(
+        cluster_tsv, sep="\t", header=None,
+        names=["cluster_head", "read_id"], dtype=str,
+    )
+    read_to_cluster = dict(
+        zip(cluster_all["read_id"].astype(str), cluster_all["cluster_head"].astype(str))
+    )
+
+    counts = Counter()
+    for read_id, lib_id in read_id_to_barcode.items():
+        ch = read_to_cluster.get(read_id)
+        if ch is None:
+            if not drop_unclustered:
+                counts[(lib_id, "__unclustered__")] += 1
+            continue
+        counts[(lib_id, ch)] += 1
+
+    cluster_counts = pd.DataFrame(
+        [{"library_id": lib, "cluster_head": ch, "n": n} for (lib, ch), n in counts.items()]
+    )
+    if cluster_counts.empty:
+        return cluster_counts, pd.DataFrame({"cluster_head": []})
+
+    count_matrix = (
+        cluster_counts.pivot_table(
+            index="cluster_head", columns="library_id",
+            values="n", fill_value=0, aggfunc="sum",
+        ).reset_index()
+    )
+    return cluster_counts, count_matrix
+
 
 def plot_library_abundance_distribution(
     cluster_counts: pd.DataFrame,
@@ -605,7 +640,7 @@ def plot_abundance_vs_differential(
     return fig, plot_data_diff
 
 
-# NEW: Plotly version for interactive hover (ID + AA sequence)
+# Plotly version for interactive hover (ID + AA sequence)
 def plot_abundance_vs_differential_plotly(
     count_matrix: pd.DataFrame,
     baseline_lib: str,
@@ -767,7 +802,7 @@ def plot_abundance_vs_differential_plotly(
 # -----------------------------
 
 
-# NEW: ClustalW (EMBL-EBI server) + MSA sorting + colored display
+# ClustalW (EMBL-EBI server) + MSA sorting + colored display
 # -----------------------------
 EBI_REST_ROOT = "https://www.ebi.ac.uk/Tools/services/rest"
 CLUSTALW_SERVICE = "clustalw2"
@@ -1148,7 +1183,7 @@ def msa_to_colored_html(
 
     lines: list[str] = []
 
-    # --- NEW: single-row mode (no wrapping; horizontal scroll) ---
+    # single-row mode (no wrapping; horizontal scroll) ---
     if block_size is None or int(block_size) <= 0:
         for sid, s in zip(ids, seqs):
             sid_pad = sid.ljust(name_w)
@@ -1215,9 +1250,12 @@ def plot_msa_heatmap_plotly(
     aln: MultipleSeqAlignment,
     title: str = "Top-50 nanobody MSA (ClustalW server; sorted by pairwise identity)",
     aa_colors: dict[str, str] | None = None,
+    sticky_ids: set | None = None,
 ) -> go.Figure:
     if aa_colors is None:
         aa_colors = build_aa_color_map()
+    if sticky_ids is None:
+        sticky_ids = set()
 
     ids = [r.id for r in aln]
     seqs = [str(r.seq).upper().replace(".", "-") for r in aln]
@@ -1232,6 +1270,9 @@ def plot_msa_heatmap_plotly(
     Z = np.zeros((len(seqs), L), dtype=int)
     T = np.empty((len(seqs), L), dtype=object)
 
+    # Mark sticky rows in Y axis labels
+    display_ids = [f"⚠️ {id_}" if id_ in sticky_ids else id_ for id_ in ids]
+
     for i, s in enumerate(seqs):
         for j, ch in enumerate(s):
             chn = _normalize_residue(ch)
@@ -1245,28 +1286,46 @@ def plot_msa_heatmap_plotly(
         colorscale.append((i / K, col))
         colorscale.append(((i + 1) / K, col))
 
-    max_id_len = max((len(x) for x in ids), default=10)
-    left_margin = min(360, 9 * max_id_len + 40)
+    max_id_len = max((len(x) for x in display_ids), default=10)
+    left_margin = min(400, 9 * max_id_len + 40)
 
-    fig = go.Figure(
-        go.Heatmap(
-            z=Z,
-            x=list(range(1, L + 1)),
-            y=ids,
-            text=T,
-            hovertemplate="ID: %{y}<br>Align pos: %{x}<br>AA: %{text}<extra></extra>",
-            colorscale=colorscale,
-            zmin=-0.5,
-            zmax=K - 0.5,
-            showscale=False,
-        )
-    )
+    fig = go.Figure()
+
+    # Main heatmap
+    fig.add_trace(go.Heatmap(
+        z=Z,
+        x=list(range(1, L + 1)),
+        y=display_ids,
+        text=T,
+        hovertemplate="ID: %{y}<br>Align pos: %{x}<br>AA: %{text}<extra></extra>",
+        colorscale=colorscale,
+        zmin=-0.5,
+        zmax=K - 0.5,
+        showscale=False,
+    ))
+
+    # Add sticky indicator bar on the right side
+    if sticky_ids:
+        sticky_flags = [1 if id_ in sticky_ids else 0 for id_ in ids]
+        sticky_colors = ["#fce8e8" if f else "rgba(0,0,0,0)" for f in sticky_flags]
+        fig.add_trace(go.Bar(
+            x=[L + 2] * len(display_ids),
+            y=display_ids,
+            orientation="h",
+            marker=dict(color=sticky_colors, line=dict(width=0)),
+            width=0.8,
+            showlegend=True,
+            name="⚠️ Sticky sequence",
+            hovertemplate="⚠️ Sticky: %{y}<extra></extra>",
+        ))
+
     fig.update_yaxes(autorange="reversed", title="Nanobody (cluster_head)")
     fig.update_xaxes(title="Alignment position")
     fig.update_layout(
         title=title,
         height=max(520, 18 * len(ids) + 180),
         margin=dict(l=left_margin, r=20, t=70, b=60),
+        barmode="overlay",
     )
     return fig
 
@@ -1432,6 +1491,16 @@ CREATE TABLE IF NOT EXISTS raw_sequences (
   PRIMARY KEY (run_id, target, barcode, aa_sequence)
 );
 
+-- Sticky sequence results cache (persists across restarts)
+CREATE TABLE IF NOT EXISTS sticky_cache (
+  run_id            TEXT,
+  target            TEXT,
+  similarity_thresh REAL,
+  cached_at         TEXT,
+  result_json       TEXT,
+  PRIMARY KEY (run_id, target, similarity_thresh)
+);
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_raw_sequences_aa ON raw_sequences(aa_sequence);
 CREATE INDEX IF NOT EXISTS idx_raw_sequences_run ON raw_sequences(run_id);
@@ -1458,7 +1527,7 @@ def sql_df(conn: sqlite3.Connection, sql: str, params=()) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INGEST — whole run, one target at a time using Test12.py pipeline
+# INGEST — whole run, one target at a time 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _compute_target(args: dict) -> dict:
@@ -1532,6 +1601,7 @@ def _compute_target(args: dict) -> dict:
             if twox_dir:    all_lib_paths["2xpanned"]  = twox_dir
 
             per_barcode_fastas = {}
+            read_id_to_barcode: Dict[str, str] = {}  # for optimized count matrix
             for lib_id, lib_path in all_lib_paths.items():
                 seq_counts = {}
                 bc_fasta = tmp_path / f"trimmed_{lib_id}.fasta"
@@ -1552,6 +1622,7 @@ def _compute_target(args: dict) -> dict:
                                     continue
                                 seq_counts[prot] = seq_counts.get(prot, 0) + 1
                                 bc_out.write(f">{record.id}\n{prot}\n")
+                                read_id_to_barcode[record.id] = lib_id  # capture mapping
                 barcode_raw_seqs[lib_id] = seq_counts
                 per_barcode_fastas[lib_id] = bc_fasta
                 log(f"  {lib_id}: {sum(seq_counts.values()):,} passing, {len(seq_counts):,} unique")
@@ -1589,11 +1660,8 @@ def _compute_target(args: dict) -> dict:
             log("Clustering complete")
 
             log("Building count matrix...")
-            lib_paths = {"control": control_dir}
-            if onex_dir: lib_paths["1xpanned"] = onex_dir
-            if twox_dir: lib_paths["2xpanned"]  = twox_dir
-            cluster_counts_df, count_matrix = build_cluster_counts_and_matrix(
-                library_paths=lib_paths,
+            cluster_counts_df, count_matrix = build_cluster_counts_from_map(
+                read_id_to_barcode=read_id_to_barcode,
                 cluster_tsv=cluster_tsv,
                 drop_unclustered=drop_unclustered,
             )
@@ -2063,7 +2131,7 @@ def page_enrichment(conn: sqlite3.Connection):
         st.warning("No cluster counts found for this target.")
         return
 
-    # Use normalized counts (Test12.py)
+    # Use normalized counts 
     count_matrix_for_plots = count_matrix.copy()
     for lib in ["control", "1xpanned", "2xpanned"]:
         norm_col = f"{lib}_norm"
@@ -2109,7 +2177,7 @@ def page_enrichment(conn: sqlite3.Connection):
             key=f"sticky_thresh_{run_id}_{target}"
         )
 
-        top_ids = count_matrix["cluster_head"].astype(str).head(top_n).tolist()
+        top_ids = cm_display["cluster_head"].astype(str).head(top_n).tolist()
         placeholders = ",".join(["?"]*len(top_ids))
         seqs_df = sql_df(conn,
             f"SELECT cluster_head, aa_sequence, aa_length FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
@@ -2119,19 +2187,37 @@ def page_enrichment(conn: sqlite3.Connection):
             seqs_df["_order"] = seqs_df["cluster_head"].map({ch: i for i, ch in enumerate(top_ids)})
             seqs_df = seqs_df.sort_values("_order").drop("_order", axis=1)
 
-            # Check for sticky sequences — cache in session state per run+target+threshold
+            # Check for sticky sequences — cache in DB for persistence across restarts
             sticky_cache_key = f"sticky_{run_id}_{target}_{sticky_threshold}"
             other_runs = sql_df(conn, "SELECT run_id FROM run WHERE run_id != ?", (run_id,))
             if not other_runs.empty:
-                if sticky_cache_key not in st.session_state:
+                # Check DB cache first
+                cached = conn.execute(
+                    "SELECT result_json FROM sticky_cache WHERE run_id=? AND target=? AND similarity_thresh=?",
+                    (run_id, target, float(sticky_threshold))
+                ).fetchone()
+
+                if cached:
+                    import json as _json
+                    sticky_map = _json.loads(cached[0])
+                    st.caption("Sticky sequences loaded from cache.")
+                else:
                     with st.spinner("Checking for sticky sequences across other runs..."):
-                        st.session_state[sticky_cache_key] = find_sticky_sequences(
+                        sticky_map = find_sticky_sequences(
                             conn, run_id, target, top_ids,
                             similarity_threshold=float(sticky_threshold)
                         )
-                else:
-                    st.caption("Sticky sequences loaded from cache.")
-                sticky_map = st.session_state[sticky_cache_key]
+                    # Save to DB cache
+                    import json as _json
+                    with conn:
+                        conn.execute(
+                            """INSERT OR REPLACE INTO sticky_cache
+                               (run_id, target, similarity_thresh, cached_at, result_json)
+                               VALUES (?,?,?,?,?)""",
+                            (run_id, target, float(sticky_threshold),
+                             datetime.utcnow().isoformat(),
+                             _json.dumps(sticky_map))
+                        )
             else:
                 sticky_map = {}
                 st.caption("No other runs in database — sticky sequence detection skipped.")
@@ -2190,10 +2276,22 @@ def page_enrichment(conn: sqlite3.Connection):
 
 
     st.divider()
-    # MSA panel (Test16.py)
-    with st.expander("Multiple sequence alignment — top 50 sequences (ClustalW server)", expanded=False):
-        st.caption("Submits top 50 sequences to EMBL-EBI ClustalW2. Requires internet and a valid email.")
+    # MSA panel
+    with st.expander("Multiple sequence alignment (ClustalW server)", expanded=False):
+        st.caption("Submits sequences to EMBL-EBI ClustalW2. Requires internet and a valid email.")
         RUN_MSA = st.checkbox("Run MSA", value=False, key=f"run_msa_{run_id}_{target}")
+
+        MSA_SEQ_SOURCE = st.radio(
+            "Sequences to align",
+            ["Top N by count (default)", "Enriched candidates only (above threshold)"],
+            horizontal=True,
+            disabled=not RUN_MSA,
+            key=f"msa_source_{run_id}_{target}"
+        )
+        MSA_N = st.slider("Max sequences to align", 2, 100, 50,
+                          disabled=not RUN_MSA or MSA_SEQ_SOURCE != "Top N by count (default)",
+                          key=f"msa_n_{run_id}_{target}")
+
         CLUSTALW_EMAIL = st.text_input("Email for EMBL-EBI submission (required)",
                                         value="", disabled=not RUN_MSA,
                                         key=f"msa_email_{run_id}_{target}")
@@ -2205,17 +2303,38 @@ def page_enrichment(conn: sqlite3.Connection):
             if not CLUSTALW_EMAIL.strip() or "@" not in CLUSTALW_EMAIL:
                 st.warning("Enter a valid email address to run ClustalW2.")
             else:
-                top50_ids = count_matrix["cluster_head"].astype(str).head(50).tolist()
-                placeholders = ",".join(["?"]*len(top50_ids))
-                seqs50 = sql_df(conn,
-                    f"SELECT cluster_head, aa_sequence FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
-                    (run_id, target, *top50_ids))
-                if seqs50.empty or len(seqs50) < 2:
-                    st.info("Need at least 2 sequences for alignment.")
+                # Determine which sequences to align
+                if MSA_SEQ_SOURCE == "Enriched candidates only (above threshold)":
+                    # Use clusters that meet the enrichment threshold
+                    if "fold_enrichment" in cm_display.columns:
+                        enriched_ids = cm_display[
+                            cm_display["fold_enrichment"].notna() &
+                            (cm_display["fold_enrichment"] >= float(enrichment_threshold)) &
+                            (cm_display["control_norm"] >= float(baseline_threshold))
+                        ]["cluster_head"].astype(str).head(100).tolist()
+                    else:
+                        enriched_ids = []
+                    if len(enriched_ids) < 2:
+                        st.warning(f"Only {len(enriched_ids)} enriched candidate(s) found above thresholds — need at least 2. Try lowering the thresholds.")
+                        msa_ids = []
+                    else:
+                        msa_ids = enriched_ids
+                        st.caption(f"Aligning {len(msa_ids)} enriched candidates (fold ≥ {enrichment_threshold}×, baseline ≥ {baseline_threshold})")
                 else:
-                    seqs50["_order"] = seqs50["cluster_head"].map({ch: i for i, ch in enumerate(top50_ids)})
-                    seqs50 = seqs50.sort_values("_order").drop("_order", axis=1)
-                    fasta_in = seq_df_to_fasta_text(seqs50)
+                    msa_ids = cm_display["cluster_head"].astype(str).head(MSA_N).tolist()
+                    st.caption(f"Aligning top {len(msa_ids)} sequences by count")
+
+                if msa_ids:
+                    placeholders = ",".join(["?"]*len(msa_ids))
+                    seqs50 = sql_df(conn,
+                        f"SELECT cluster_head, aa_sequence FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
+                        (run_id, target, *msa_ids))
+                    if seqs50.empty or len(seqs50) < 2:
+                        st.info("Need at least 2 sequences for alignment.")
+                    else:
+                        seqs50["_order"] = seqs50["cluster_head"].map({ch: i for i, ch in enumerate(msa_ids)})
+                        seqs50 = seqs50.sort_values("_order").drop("_order", axis=1)
+                        fasta_in = seq_df_to_fasta_text(seqs50)
                     try:
                         with st.spinner("Submitting to ClustalW2 server..."):
                             aln_result = clustalw2_align_via_ebi(
@@ -2229,13 +2348,49 @@ def page_enrichment(conn: sqlite3.Connection):
 
                         tabs = st.tabs(["Alignment viewer", "Pairwise identity", "Raw ClustalW output"])
                         with tabs[0]:
-                            fig_msa = plot_msa_heatmap_plotly(msa_sorted)
+                            # Pass sticky_ids from the already-computed sticky_map
+                            msa_sticky_ids = set(sticky_map.keys()) if sticky_map else set()
+                            # Build a set of prefixes that match MSA truncated IDs
+                            msa_display_ids = {str(r.id) for r in msa_sorted}
+                            msa_sticky_matched = set()
+                            for did in msa_display_ids:
+                                for sid in msa_sticky_ids:
+                                    if sid.startswith(did) or did.startswith(sid):
+                                        msa_sticky_matched.add(did)
+                                        break
+                            fig_msa = plot_msa_heatmap_plotly(msa_sorted, sticky_ids=msa_sticky_matched)
                             st.plotly_chart(fig_msa, use_container_width=True)
                             with st.expander("Colored alignment text (scroll)", expanded=False):
                                 msa_html = msa_to_colored_html(msa_sorted, block_size=None)
                                 components.html(msa_html, height=660, scrolling=True)
                         with tabs[1]:
-                            st.dataframe(msa_rank_df, use_container_width=True)
+                            # Add sticky column to msa_rank_df
+                            rank_display = msa_rank_df.copy()
+                            # Match on prefix since ClustalW truncates IDs
+                            def _is_sticky(id_val, sticky_set):
+                                if id_val in sticky_set:
+                                    return "⚠️ YES"
+                                # Try prefix match (ClustalW truncates long IDs)
+                                for sid in sticky_set:
+                                    if sid.startswith(id_val) or id_val.startswith(sid):
+                                        return "⚠️ YES"
+                                return ""
+                            rank_display["sticky"] = rank_display["id"].apply(
+                                lambda x: _is_sticky(x, msa_sticky_ids)
+                            )
+                            # Reorder columns to put sticky first
+                            cols = ["rank", "id", "sticky"] + [c for c in rank_display.columns if c not in ["rank","id","sticky"]]
+                            rank_display = rank_display[cols]
+
+                            def highlight_sticky_row(row):
+                                if row.get("sticky") == "⚠️ YES":
+                                    return ["background-color: #fce8e8; color: #666666"] * len(row)
+                                return [""] * len(row)
+
+                            st.dataframe(
+                                rank_display.style.apply(highlight_sticky_row, axis=1),
+                                use_container_width=True
+                            )
                             with st.expander("Full pairwise identity matrix"):
                                 st.dataframe(pid_sorted, use_container_width=True)
                         with tabs[2]:
@@ -2248,7 +2403,7 @@ def page_enrichment(conn: sqlite3.Connection):
                         st.error(f"MSA failed: {e}")
 
 
-    # Abundance distribution (Test12.py)
+    # Abundance distribution 
     st.subheader("Abundance distribution by library")
     cluster_counts_long = sql_df(conn,
         "SELECT library_id, cluster_head, raw_count as n FROM cluster_counts WHERE run_id=? AND target=?",
@@ -2360,8 +2515,7 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
 
     with st.expander("MMseqs2 parameters"):
         use_linclust  = st.checkbox("Use easy-linclust (fast) instead of easy-cluster",
-                                    value=False,
-                                    help="easy-cluster matches Test12.py exactly. easy-linclust is ~10x faster.")
+                                    value=False)
         mm_min_seq_id = st.number_input("min_seq_id", 0.0, 1.0, 0.90, 0.01, format="%.2f")
         mm_coverage   = st.number_input("coverage",   0.0, 1.0, 0.90, 0.01, format="%.2f")
         mm_cov_mode   = st.number_input("cov_mode",   0, 5, 0, 1)
@@ -2484,10 +2638,9 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
                 progress_cb=log,
             )
             st.success(f"✅ Ingest complete! Run ID: `{run_id}`")
-            # Clear sticky sequence cache — new run may affect results for all targets
-            for k in list(st.session_state.keys()):
-                if k.startswith("sticky_"):
-                    del st.session_state[k]
+            # Clear sticky DB cache — new run affects results for all existing targets
+            with conn:
+                conn.execute("DELETE FROM sticky_cache")
         except Exception as e:
             st.error(f"Ingest failed: {e}")
 
@@ -2500,16 +2653,23 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
             format_func=lambda r: runs[runs["run_id"]==r]["sample_id"].iloc[0],
             key="del_run")
         if st.button("Delete run", type="secondary"):
-            with conn:
-                conn.execute("PRAGMA foreign_keys=OFF;")
-                for tbl in ["cluster_sequences","cluster_counts","target_run","run"]:
-                    conn.execute(f"DELETE FROM {tbl} WHERE run_id=?", (del_run,))
-                conn.execute("PRAGMA foreign_keys=ON;")
-            for k in list(st.session_state.keys()):
-                if del_run in k:
-                    del st.session_state[k]
-            st.success("Deleted.")
-            st.rerun()
+            try:
+                del_conn = connect_db(db_path)
+                del_conn.execute("PRAGMA foreign_keys=OFF;")
+                for tbl in ["cluster_sequences","cluster_counts","target_run",
+                            "raw_sequences","sticky_cache","run"]:
+                    del_conn.execute(f"DELETE FROM {tbl} WHERE run_id=?", (del_run,))
+                del_conn.execute("DELETE FROM sticky_cache")
+                del_conn.commit()
+                del_conn.execute("PRAGMA foreign_keys=ON;")
+                del_conn.close()
+                for k in list(st.session_state.keys()):
+                    if del_run in k:
+                        del st.session_state[k]
+                st.success("Deleted.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Delete failed: {e}. Try restarting the app first.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2517,8 +2677,8 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    st.set_page_config(page_title="MinION Nanobody Analysis v2", layout="wide")
-    st.title("MinION Nanobody Analysis v2")
+    st.set_page_config(page_title="MinION Nanobody Analysis", layout="wide")
+    st.title("MinION Nanobody Analysis")
 
     db_path = Path(DEFAULT_DB).expanduser()
     conn = connect_db(db_path)
