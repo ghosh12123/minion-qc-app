@@ -64,12 +64,6 @@ Then open your browser and go to `http://localhost:8501`.
 
 1. Go to the **Ingest** page and enter the path to your run folder (e.g. `/Users/you/Downloads/run5`). The app auto-detects all barcode folders and groups them by target.
 2. Set your START and END anchor sequences, minimum AA length, and MMseqs2 parameters.
-3. If your run has no TG1 barcode of its own, use the **External TG1** section to select a TG1 from an already-ingested run or provide a folder path directly.
-4. Click **Start Ingest**. Results are stored in a local SQLite database (`~/minion_nanobody_v2.db`) and never need to be recomputed.
+3. If your run has no TG1/R1/R2 barcode of its own, you can select another barcode to act as your TG1/R1/R2 from a from an already-ingested run or provide a folder path directly.
+4. Click **Start Ingest**. Results are stored in a local SQLite database (`~/minion_nanobody.db`) and never need to be recomputed.
 5. Go to the **Enrichment** page, select a run and target, and explore the results.
-
-## Notes
-
-- Default anchor sequences (`ATGGCC` / `GGCGCGC`) are construct-specific. Change them if your library uses a different vector.
-- `easy-cluster` (default) matches the lab's existing pipeline exactly. `easy-linclust` is ~10x faster but slightly less accurate.
-- The baseline threshold should be adjusted based on TG1 sequencing depth. Lower TG1 depth = lower threshold.
