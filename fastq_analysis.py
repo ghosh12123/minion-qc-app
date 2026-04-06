@@ -36,7 +36,6 @@ from Bio.SeqRecord import SeqRecord
 import matplotlib.colors as mcolors
 from plotly.subplots import make_subplots
 
-
 # -----------------------------
 # Helpers (folders / names)
 # -----------------------------
@@ -1530,7 +1529,7 @@ def sql_df(conn: sqlite3.Connection, sql: str, params=()) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INGEST — whole run, one target at a time 
+# INGEST
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _compute_target(args: dict) -> dict:
@@ -2159,8 +2158,8 @@ def page_enrichment(conn: sqlite3.Connection):
         cm_display = cm_display.sort_values("fold_enrichment", ascending=False, na_position="last")
 
     st.subheader(f"Cluster count matrix — {target}")
-    preferred = ["cluster_head","control","1xpanned","2xpanned","control_norm","1xpanned_norm","2xpanned_norm","fold_enrichment"]
-    display_cols = [c for c in preferred if c in cm_display.columns] +                    [c for c in cm_display.columns if c not in preferred]
+    preferred = ["cluster_head","control_norm","1xpanned_norm","2xpanned_norm","fold_enrichment"]
+    display_cols = [c for c in preferred if c in cm_display.columns]
     st.dataframe(cm_display[display_cols].head(30), use_container_width=True)
     st.download_button("Download count matrix CSV",
                        cm_display[display_cols].to_csv(index=False).encode(),
@@ -2406,7 +2405,7 @@ def page_enrichment(conn: sqlite3.Connection):
                         st.error(f"MSA failed: {e}")
 
 
-    # Abundance distribution
+    # Abundance distribution 
     st.subheader("Abundance distribution by library")
     cluster_counts_long = sql_df(conn,
         "SELECT library_id, cluster_head, raw_count as n FROM cluster_counts WHERE run_id=? AND target=?",
@@ -2429,7 +2428,7 @@ def page_enrichment(conn: sqlite3.Connection):
     # Determine condition libs (may only have 1xpanned if no R2)
     condition_libs = [c for c in ["1xpanned", "2xpanned"] if c in count_matrix_for_plots.columns and count_matrix_for_plots[c].sum() > 0]
 
-    # Interactive Plotly scatter 
+    # Interactive Plotly scatter
     st.subheader("Differential abundance")
     diff_fig_plotly = plot_abundance_vs_differential_plotly(
         count_matrix=count_matrix_for_plots,
