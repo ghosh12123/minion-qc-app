@@ -1,9 +1,10 @@
 """
-MinION Nanobody Analysis
+MinION Nanobody Analysis — v2
 """
 
 import gzip
 import hashlib
+import io
 import multiprocessing as mp
 import os
 import json
@@ -641,7 +642,7 @@ def plot_abundance_vs_differential(
     return fig, plot_data_diff
 
 
-# NEW: Plotly version for interactive hover (ID + AA sequence)
+# Plotly version for interactive hover (ID + AA sequence)
 def plot_abundance_vs_differential_plotly(
     count_matrix: pd.DataFrame,
     baseline_lib: str,
@@ -804,7 +805,7 @@ def plot_abundance_vs_differential_plotly(
 # -----------------------------
 
 
-# NEW: ClustalW (EMBL-EBI server) + MSA sorting + colored display
+# ClustalW (EMBL-EBI server) + MSA sorting + colored display
 # -----------------------------
 EBI_REST_ROOT = "https://www.ebi.ac.uk/Tools/services/rest"
 CLUSTALW_SERVICE = "clustalw2"
@@ -1185,7 +1186,7 @@ def msa_to_colored_html(
 
     lines: list[str] = []
 
-    # --- NEW: single-row mode (no wrapping; horizontal scroll) ---
+    # --- single-row mode (no wrapping; horizontal scroll) ---
     if block_size is None or int(block_size) <= 0:
         for sid, s in zip(ids, seqs):
             sid_pad = sid.ljust(name_w)
@@ -1529,7 +1530,7 @@ def sql_df(conn: sqlite3.Connection, sql: str, params=()) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INGEST
+# INGEST — whole run, one target at a time 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _compute_target(args: dict) -> dict:
@@ -2094,6 +2095,225 @@ def page_overview(conn: sqlite3.Connection):
         st.dataframe(targets, use_container_width=True)
 
 
+def generate_enrichment_pdf(
+    conn: sqlite3.Connection,
+    run_id: str,
+    target: str,
+    cm_display: pd.DataFrame,
+    display_cols: list,
+    sticky_map: dict,
+    baseline_threshold: float,
+    enrichment_threshold: float,
+    diff_fig,
+    abund_fig=None,
+) -> bytes:
+    """Generate a PDF report for a target enrichment analysis."""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                     TableStyle, PageBreak, Image as RLImage)
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    import io as _io
+    import matplotlib.pyplot as plt
+    import matplotlib
+    matplotlib.use("Agg")
+
+    buf = _io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter,
+                            leftMargin=0.75*inch, rightMargin=0.75*inch,
+                            topMargin=0.75*inch, bottomMargin=0.75*inch)
+    styles = getSampleStyleSheet()
+    story = []
+
+    title_style = ParagraphStyle("title", parent=styles["Title"], fontSize=16, spaceAfter=6)
+    heading_style = ParagraphStyle("heading", parent=styles["Heading2"], fontSize=12, spaceAfter=4)
+    normal_style = styles["Normal"]
+    small_style = ParagraphStyle("small", parent=styles["Normal"], fontSize=8)
+
+    # ── Title
+    run_info = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (run_id,)).fetchone()
+    sample_id = run_info[0] if run_info else run_id[:8]
+    story.append(Paragraph(f"Nanobody Enrichment Report", title_style))
+    story.append(Paragraph(f"Run: {sample_id} &nbsp;|&nbsp; Target: {target}", styles["Heading3"]))
+    story.append(Paragraph(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", small_style))
+    story.append(Spacer(1, 12))
+
+    # ── Ingest parameters
+    story.append(Paragraph("Ingest Parameters", heading_style))
+    run_params = conn.execute(
+        "SELECT start_anchor, end_anchor, min_aa_len, mm_min_seq_id, mm_coverage, use_linclust FROM run WHERE run_id=?",
+        (run_id,)).fetchone()
+    if run_params:
+        cluster_mode = "easy-linclust" if run_params[5] else "easy-cluster"
+        param_data = [
+            ["Min AA Length", "Min Seq Identity", "Coverage", "Clustering Mode"],
+            [str(run_params[2]), f"{run_params[3]:.0%}", f"{run_params[4]:.0%}", cluster_mode],
+        ]
+        param_table = Table(param_data, colWidths=[1.5*inch]*4)
+        param_table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f0f0f0")),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,-1), 9),
+            ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
+            ("ALIGN", (0,0), (-1,-1), "CENTER"),
+            ("TOPPADDING", (0,0), (-1,-1), 4),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+        ]))
+        story.append(param_table)
+    story.append(Spacer(1, 10))
+
+    # ── Analysis thresholds
+    story.append(Paragraph("Analysis Thresholds", heading_style))
+    thresh_data = [
+        ["Baseline Threshold (control_norm)", "Enrichment Threshold (fold)"],
+        [str(baseline_threshold), str(enrichment_threshold)],
+    ]
+    thresh_table = Table(thresh_data, colWidths=[3*inch, 3*inch])
+    thresh_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f0f0f0")),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+        ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
+        ("ALIGN", (0,0), (-1,-1), "CENTER"),
+        ("TOPPADDING", (0,0), (-1,-1), 4),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+    ]))
+    story.append(thresh_table)
+    story.append(Spacer(1, 10))
+
+    # ── Target QC stats
+    story.append(Paragraph("Target Statistics", heading_style))
+    tr = conn.execute(
+        "SELECT total_reads_control, total_reads_1xpanned, total_reads_2xpanned, kept_filtered, n_clusters FROM target_run WHERE run_id=? AND target=?",
+        (run_id, target)).fetchone()
+    if tr:
+        qc_data = [
+            ["Control Reads", "R1 Reads", "R2 Reads", "Sequences (post-filter)", "Clusters"],
+            [f"{tr[0]:,}", f"{tr[1]:,}", f"{tr[2]:,}", f"{tr[3]:,}", f"{tr[4]:,}"],
+        ]
+        qc_table = Table(qc_data, colWidths=[1.4*inch]*5)
+        qc_table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f0f0f0")),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,-1), 9),
+            ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
+            ("ALIGN", (0,0), (-1,-1), "CENTER"),
+            ("TOPPADDING", (0,0), (-1,-1), 4),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+        ]))
+        story.append(qc_table)
+    story.append(Spacer(1, 10))
+
+    # ── Sticky summary
+    n_sticky = len(sticky_map)
+    sticky_color = colors.HexColor("#fce8e8") if n_sticky > 0 else colors.HexColor("#d4edda")
+    sticky_text = f"Sticky sequences: {n_sticky} flagged (appear in other runs at {100}% identity)"
+    story.append(Paragraph(sticky_text, ParagraphStyle("sticky", parent=normal_style,
+                                                         backColor=sticky_color, borderPad=4)))
+    story.append(Spacer(1, 10))
+
+    # ── Differential abundance plot
+    story.append(Paragraph("Differential Abundance Plot", heading_style))
+    if diff_fig is not None:
+        try:
+            img_buf = _io.BytesIO()
+            diff_fig.savefig(img_buf, format="png", dpi=150, bbox_inches="tight")
+            img_buf.seek(0)
+            img = RLImage(img_buf, width=6.5*inch, height=4*inch)
+            story.append(img)
+        except Exception:
+            story.append(Paragraph("(Plot could not be rendered)", small_style))
+    story.append(Spacer(1, 10))
+
+    # ── Abundance distribution plot
+    story.append(Paragraph("Abundance Distribution by Library", heading_style))
+    if abund_fig is not None:
+        try:
+            img_buf2 = _io.BytesIO()
+            abund_fig.savefig(img_buf2, format="png", dpi=150, bbox_inches="tight")
+            img_buf2.seek(0)
+            img2 = RLImage(img_buf2, width=4*inch, height=4*inch)
+            story.append(img2)
+        except Exception:
+            story.append(Paragraph("(Plot could not be rendered)", small_style))
+    story.append(Spacer(1, 10))
+
+    # ── Count matrix table (top 30)
+    story.append(PageBreak())
+    story.append(Paragraph(f"Top Clusters by Fold Enrichment", heading_style))
+
+    top_df = cm_display[display_cols].head(30).copy()
+    # Flag sticky
+    top_df["sticky"] = top_df["cluster_head"].apply(lambda x: "YES" if x in sticky_map else "")
+
+    # Build table
+    col_headers = ["#", "cluster_head"] + [c for c in display_cols if c != "cluster_head"] + ["sticky"]
+    table_data = [col_headers]
+    for i, (_, row) in enumerate(top_df.iterrows(), 1):
+        r = [str(i), row["cluster_head"][:20] + "..."] +             [str(row.get(c, "")) for c in display_cols if c != "cluster_head"] +             [row.get("sticky", "")]
+        table_data.append(r)
+
+    col_widths = [0.3*inch, 2.2*inch] + [0.9*inch] * (len(display_cols) - 1) + [0.5*inch]
+    cm_table = Table(table_data, colWidths=col_widths, repeatRows=1)
+    table_style = [
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f0f0f0")),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 7),
+        ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+        ("ALIGN", (0,0), (-1,-1), "CENTER"),
+        ("ALIGN", (1,0), (1,-1), "LEFT"),
+        ("TOPPADDING", (0,0), (-1,-1), 2),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 2),
+    ]
+    # Highlight sticky rows
+    for i, (_, row) in enumerate(top_df.iterrows(), 1):
+        if row.get("sticky") == "YES":
+            table_style.append(("BACKGROUND", (0,i), (-1,i), colors.HexColor("#fce8e8")))
+    cm_table.setStyle(TableStyle(table_style))
+    story.append(cm_table)
+    story.append(Spacer(1, 10))
+
+    # ── Top sequences
+    story.append(PageBreak())
+    story.append(Paragraph("Top Cluster Amino Acid Sequences", heading_style))
+    top_ids = cm_display["cluster_head"].astype(str).head(30).tolist()
+    placeholders = ",".join(["?"]*len(top_ids))
+    seqs = conn.execute(
+        f"SELECT cluster_head, aa_sequence, aa_length FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
+        (run_id, target, *top_ids)
+    ).fetchall()
+    seq_map_local = {s[0]: (s[1], s[2]) for s in seqs}
+
+    seq_data = [["#", "cluster_head", "AA length", "Sticky", "AA sequence (first 60 AA)"]]
+    for i, ch in enumerate(top_ids, 1):
+        aa_seq, aa_len = seq_map_local.get(ch, ("", 0))
+        is_sticky = "YES" if ch in sticky_map else ""
+        seq_data.append([str(i), ch[:20]+"...", str(aa_len), is_sticky, (aa_seq or "")[:60]+"..."])
+
+    seq_table = Table(seq_data, colWidths=[0.3*inch, 1.8*inch, 0.6*inch, 0.5*inch, 3.3*inch], repeatRows=1)
+    seq_style = [
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f0f0f0")),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 6.5),
+        ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+        ("ALIGN", (0,0), (3,-1), "CENTER"),
+        ("ALIGN", (4,0), (4,-1), "LEFT"),
+        ("TOPPADDING", (0,0), (-1,-1), 2),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 2),
+    ]
+    for i, ch in enumerate(top_ids, 1):
+        if ch in sticky_map:
+            seq_style.append(("BACKGROUND", (0,i), (-1,i), colors.HexColor("#fce8e8")))
+    seq_table.setStyle(TableStyle(seq_style))
+    story.append(seq_table)
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
+
+
 def page_enrichment(conn: sqlite3.Connection):
     st.header("Enrichment & Candidates")
     runs = sql_df(conn, "SELECT run_id, sample_id FROM run ORDER BY ingested_at DESC")
@@ -2112,6 +2332,22 @@ def page_enrichment(conn: sqlite3.Connection):
 
     target = st.selectbox("Target", targets_df["target"].tolist())
 
+    # Show ingest parameters for this run
+    run_params = sql_df(conn,
+        "SELECT start_anchor, end_anchor, min_aa_len, mm_min_seq_id, mm_coverage, mm_cov_mode, use_linclust FROM run WHERE run_id=?",
+        (run_id,))
+    if not run_params.empty:
+        p = run_params.iloc[0]
+        cluster_mode = "easy-linclust" if p["use_linclust"] else "easy-cluster"
+        with st.expander("Ingest parameters used for this run", expanded=False):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Min AA length", p["min_aa_len"])
+            with col2:
+                st.metric("Min seq identity", f"{p['mm_min_seq_id']:.0%}")
+            with col3:
+                st.metric("Coverage", f"{p['mm_coverage']:.0%}")
+
     col1, col2 = st.columns(2)
     with col1:
         baseline_threshold = st.number_input("Baseline threshold", min_value=0,
@@ -2119,6 +2355,9 @@ def page_enrichment(conn: sqlite3.Connection):
     with col2:
         enrichment_threshold = st.number_input("Enrichment threshold (fold)", min_value=0.0001,
                                                 value=DEFAULT_ENRICHMENT_THRESHOLD, step=1.0)
+
+    # PDF export placeholder — above all sliders
+    pdf_placeholder = st.empty()
 
     show_sequences = st.checkbox("Show top cluster amino-acid sequences", value=True)
     top_n = st.slider("How many top clusters to show", 1, 100, 30, disabled=not show_sequences)
@@ -2133,12 +2372,15 @@ def page_enrichment(conn: sqlite3.Connection):
         st.warning("No cluster counts found for this target.")
         return
 
-    # Use normalized counts 
+    # Use normalized counts
     count_matrix_for_plots = count_matrix.copy()
     for lib in ["control", "1xpanned", "2xpanned"]:
         norm_col = f"{lib}_norm"
         if norm_col in count_matrix_for_plots.columns:
             count_matrix_for_plots[lib] = pd.to_numeric(count_matrix_for_plots[norm_col], errors="coerce")
+
+    # Determine condition libs early (needed for PDF export and plots)
+    condition_libs = [c for c in ["1xpanned", "2xpanned"] if c in count_matrix_for_plots.columns and count_matrix_for_plots[c].sum() > 0]
 
     # Count matrix preview — add fold_enrichment column
     cm_display = count_matrix.copy()
@@ -2157,10 +2399,65 @@ def page_enrichment(conn: sqlite3.Connection):
         )
         cm_display = cm_display.sort_values("fold_enrichment", ascending=False, na_position="last")
 
+    # Compute sticky sequences early so we can highlight both tables
+    sticky_threshold = st.slider(
+        "Sticky sequence similarity threshold",
+        min_value=0.80, max_value=1.0, value=1.0, step=0.01,
+        format="%.2f",
+        help="1.0 = exact match only. Lower values catch near-identical sequences across runs.",
+        key=f"sticky_thresh_{run_id}_{target}"
+    )
+
+    top_ids = cm_display["cluster_head"].astype(str).head(top_n).tolist()
+    other_runs = sql_df(conn, "SELECT run_id FROM run WHERE run_id != ?", (run_id,))
+    if not other_runs.empty:
+        sticky_cache_key = f"sticky_{run_id}_{target}_{sticky_threshold}"
+        cached = conn.execute(
+            "SELECT result_json FROM sticky_cache WHERE run_id=? AND target=? AND similarity_thresh=?",
+            (run_id, target, float(sticky_threshold))
+        ).fetchone()
+        if cached:
+            import json as _json
+            sticky_map = _json.loads(cached[0])
+        else:
+            with st.spinner("Checking for sticky sequences across other runs..."):
+                sticky_map = find_sticky_sequences(
+                    conn, run_id, target, top_ids,
+                    similarity_threshold=float(sticky_threshold)
+                )
+            import json as _json
+            with conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO sticky_cache
+                       (run_id, target, similarity_thresh, cached_at, result_json)
+                       VALUES (?,?,?,?,?)""",
+                    (run_id, target, float(sticky_threshold),
+                     datetime.utcnow().isoformat(),
+                     _json.dumps(sticky_map))
+                )
+    else:
+        sticky_map = {}
+
+    # Sticky cluster heads set
+    sticky_cluster_heads = set(sticky_map.keys())
+
+    def highlight_sticky_cm(row):
+        if row.get("cluster_head") in sticky_cluster_heads:
+            return ["background-color: #fce8e8; color: #666666"] * len(row)
+        return [""] * len(row)
+
     st.subheader(f"Cluster count matrix — {target}")
+    if sticky_cluster_heads:
+        st.warning(f"⚠️ {len(sticky_cluster_heads)} sticky sequence(s) found — highlighted in red")
+    else:
+        st.success("✅ No sticky sequences found in other runs")
     preferred = ["cluster_head","control_norm","1xpanned_norm","2xpanned_norm","fold_enrichment"]
     display_cols = [c for c in preferred if c in cm_display.columns]
-    st.dataframe(cm_display[display_cols].head(30), use_container_width=True)
+    cm_show = cm_display[display_cols].head(top_n)
+    if sticky_cluster_heads:
+        st.dataframe(cm_show.style.apply(highlight_sticky_cm, axis=1), use_container_width=True)
+    else:
+        st.dataframe(cm_show, use_container_width=True)
     st.download_button("Download count matrix CSV",
                        cm_display[display_cols].to_csv(index=False).encode(),
                        f"{run_id[:8]}_{target}_count_matrix.csv", "text/csv")
@@ -2169,15 +2466,6 @@ def page_enrichment(conn: sqlite3.Connection):
     # Top sequences with sticky detection
     if show_sequences:
         st.subheader(f"Top {top_n} cluster amino-acid sequences")
-
-        # Similarity threshold for sticky detection
-        sticky_threshold = st.slider(
-            "Sticky sequence similarity threshold",
-            min_value=0.80, max_value=1.0, value=1.0, step=0.01,
-            format="%.2f",
-            help="1.0 = exact match only. Lower values catch near-identical sequences across runs.",
-            key=f"sticky_thresh_{run_id}_{target}"
-        )
 
         top_ids = cm_display["cluster_head"].astype(str).head(top_n).tolist()
         placeholders = ",".join(["?"]*len(top_ids))
@@ -2189,40 +2477,7 @@ def page_enrichment(conn: sqlite3.Connection):
             seqs_df["_order"] = seqs_df["cluster_head"].map({ch: i for i, ch in enumerate(top_ids)})
             seqs_df = seqs_df.sort_values("_order").drop("_order", axis=1)
 
-            # Check for sticky sequences — cache in DB for persistence across restarts
-            sticky_cache_key = f"sticky_{run_id}_{target}_{sticky_threshold}"
-            other_runs = sql_df(conn, "SELECT run_id FROM run WHERE run_id != ?", (run_id,))
-            if not other_runs.empty:
-                # Check DB cache first
-                cached = conn.execute(
-                    "SELECT result_json FROM sticky_cache WHERE run_id=? AND target=? AND similarity_thresh=?",
-                    (run_id, target, float(sticky_threshold))
-                ).fetchone()
-
-                if cached:
-                    import json as _json
-                    sticky_map = _json.loads(cached[0])
-                    st.caption("Sticky sequences loaded from cache.")
-                else:
-                    with st.spinner("Checking for sticky sequences across other runs..."):
-                        sticky_map = find_sticky_sequences(
-                            conn, run_id, target, top_ids,
-                            similarity_threshold=float(sticky_threshold)
-                        )
-                    # Save to DB cache
-                    import json as _json
-                    with conn:
-                        conn.execute(
-                            """INSERT OR REPLACE INTO sticky_cache
-                               (run_id, target, similarity_thresh, cached_at, result_json)
-                               VALUES (?,?,?,?,?)""",
-                            (run_id, target, float(sticky_threshold),
-                             datetime.utcnow().isoformat(),
-                             _json.dumps(sticky_map))
-                        )
-            else:
-                sticky_map = {}
-                st.caption("No other runs in database — sticky sequence detection skipped.")
+            # sticky_map already computed above
 
             # Build display dataframe with sticky info
             display_rows = []
@@ -2278,7 +2533,7 @@ def page_enrichment(conn: sqlite3.Connection):
 
 
     st.divider()
-    # MSA panel 
+    # MSA panel
     with st.expander("Multiple sequence alignment (ClustalW server)", expanded=False):
         st.caption("Submits sequences to EMBL-EBI ClustalW2. Requires internet and a valid email.")
         RUN_MSA = st.checkbox("Run MSA", value=False, key=f"run_msa_{run_id}_{target}")
@@ -2425,10 +2680,7 @@ def page_enrichment(conn: sqlite3.Connection):
         (run_id, target))
     aa_seq_map = dict(zip(seqs_all["cluster_head"], seqs_all["aa_sequence"])) if not seqs_all.empty else {}
 
-    # Determine condition libs (may only have 1xpanned if no R2)
-    condition_libs = [c for c in ["1xpanned", "2xpanned"] if c in count_matrix_for_plots.columns and count_matrix_for_plots[c].sum() > 0]
-
-    # Interactive Plotly scatter
+    # Interactive Plotly scatter 
     st.subheader("Differential abundance")
     diff_fig_plotly = plot_abundance_vs_differential_plotly(
         count_matrix=count_matrix_for_plots,
@@ -2439,6 +2691,52 @@ def page_enrichment(conn: sqlite3.Connection):
         aa_seq_map=aa_seq_map,
     )
     st.plotly_chart(diff_fig_plotly, use_container_width=True)
+
+    # Populate PDF export button now that all data is available
+    with pdf_placeholder.container():
+        if st.button("Export enrichment report (PDF)", key=f"pdf_{run_id}_{target}"):
+            with st.spinner("Generating PDF..."):
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        diff_fig_for_pdf, _ = plot_abundance_vs_differential(
+                            count_matrix=count_matrix_for_plots,
+                            baseline_lib="control",
+                            condition_libs=condition_libs,
+                            baseline_threshold=int(baseline_threshold),
+                            enrichment_threshold=float(enrichment_threshold),
+                            out_pdf=Path(tmp)/"d.pdf",
+                            out_tsv=Path(tmp)/"d.tsv",
+                        )
+                        # Generate abundance figure
+                        cluster_counts_long = sql_df(conn,
+                            "SELECT library_id, cluster_head, raw_count as n FROM cluster_counts WHERE run_id=? AND target=?",
+                            (run_id, target))
+                        if not cluster_counts_long.empty:
+                            abund_fig_for_pdf, _ = plot_library_abundance_distribution(
+                                cluster_counts_long,
+                                out_pdf=Path(tmp)/"a.pdf",
+                                out_tsv=Path(tmp)/"a.tsv"
+                            )
+                        else:
+                            abund_fig_for_pdf = None
+                    pdf_bytes = generate_enrichment_pdf(
+                        conn=conn, run_id=run_id, target=target,
+                        cm_display=cm_display, display_cols=display_cols,
+                        sticky_map=sticky_map,
+                        baseline_threshold=baseline_threshold,
+                        enrichment_threshold=enrichment_threshold,
+                        diff_fig=diff_fig_for_pdf,
+                        abund_fig=abund_fig_for_pdf,
+                    )
+                    st.download_button(
+                        "Download PDF",
+                        pdf_bytes,
+                        f"{run_id[:8]}_{target}_enrichment_report.pdf",
+                        "application/pdf",
+                        key=f"pdf_dl_{run_id}_{target}"
+                    )
+                except Exception as e:
+                    st.error(f"PDF generation failed: {e}")
 
     # Enriched candidates table
     with st.expander("Enriched candidates table + download"):
