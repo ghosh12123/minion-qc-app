@@ -1,5 +1,5 @@
 """
-MinION Nanobody Analysis — v2
+MinION Nanobody Analysis
 """
 
 import gzip
